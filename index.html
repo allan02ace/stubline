@@ -1249,12 +1249,17 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   // the receipt's actual four corners, including tilted/rotated shots (not
   // just axis-aligned edges). Pipeline: blur -> Sobel gradient -> threshold
   // to a binary edge map -> dilate to close small gaps -> flood-fill the
-  // background in from the image borders (blocked by edges) -> take the
-  // boundary of whatever's left as the document silhouette -> convex hull
-  // -> pick the 4 extreme corners (min/max of x+y and x-y, the standard
-  // "order points" trick for quadrilaterals at any rotation).
+  // background in from the image borders (blocked by edges) -> label the
+  // *individual* objects left over (a busy desk usually has several: the
+  // receipt, but also a laptop, food containers, a notebook, etc.) -> score
+  // each one on how rectangular, appropriately sized, and centered it is ->
+  // take the 4 extreme corners of the best-scoring one (min/max of x+y and
+  // x-y, the standard "order points" trick for quadrilaterals at any
+  // rotation). Scoring each object separately — rather than hulling every
+  // object on the desk together — is what keeps the trace on the actual
+  // document instead of ballooning out to the whole tabletop.
   // Falls back to detectEdgeBox() (axis-aligned) and then a default inset
-  // if the shot is too low-contrast or the geometry looks unreliable —
+  // if the shot is too low-contrast or no candidate looks document-shaped —
   // the corners always stay draggable for fine-tuning either way.
   function detectQuad(img) {
     try {
@@ -1320,44 +1325,94 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
 
       var fgCount = 0;
       for (var i = 0; i < w * h; i++) if (!bg[i]) fgCount++;
-      if (fgCount < w * h * 0.05 || fgCount > w * h * 0.95) return null; // unreliable blob size
+      if (fgCount < w * h * 0.02 || fgCount > w * h * 0.95) return null; // unreliable blob size
 
-      // boundary points of the unreached (document) region, for the hull
-      var boundaryPoints = [];
+      // The "not background" mask usually contains several separate objects
+      // (the receipt, but also a laptop, containers, a notebook, etc. sitting
+      // on the same desk) — NOT just one document. Taking the convex hull of
+      // all of them at once wraps the whole cluttered surface. So instead we
+      // split the mask into individual connected components (edges and
+      // background both act as separators) and score each one as a
+      // *candidate document*, then keep only the best-scoring candidate.
+      var label = new Int32Array(w * h); // 0 = not interior / unlabeled
+      var stack = new Int32Array(w * h);
+      var comps = [];
       for (var y = 0; y < h; y++) {
         for (var x = 0; x < w; x++) {
-          var idx2 = y * w + x;
-          if (bg[idx2]) continue;
-          if (x === 0 || x === w - 1 || y === 0 || y === h - 1 ||
-              (x > 0 && bg[idx2 - 1]) || (x < w - 1 && bg[idx2 + 1]) ||
-              (y > 0 && bg[idx2 - w]) || (y < h - 1 && bg[idx2 + w])) {
-            boundaryPoints.push([x, y]);
+          var startIdx = y * w + x;
+          if (bg[startIdx] || edge[startIdx] || label[startIdx]) continue;
+          var id = comps.length + 1;
+          var sp = 0;
+          stack[sp++] = startIdx;
+          label[startIdx] = id;
+          var area = 0, touchesBorder = false, boundaryPoints = [];
+          while (sp > 0) {
+            var cur = stack[--sp];
+            var cx = cur % w, cy = (cur / w) | 0;
+            area++;
+            var isBoundary = false;
+            if (cx === 0 || cx === w - 1 || cy === 0 || cy === h - 1) { touchesBorder = true; isBoundary = true; }
+            var nIdx;
+            if (cx + 1 < w) { nIdx = cy * w + (cx + 1); if (bg[nIdx] || edge[nIdx]) isBoundary = true; else if (!label[nIdx]) { label[nIdx] = id; stack[sp++] = nIdx; } }
+            if (cx - 1 >= 0) { nIdx = cy * w + (cx - 1); if (bg[nIdx] || edge[nIdx]) isBoundary = true; else if (!label[nIdx]) { label[nIdx] = id; stack[sp++] = nIdx; } }
+            if (cy + 1 < h) { nIdx = (cy + 1) * w + cx; if (bg[nIdx] || edge[nIdx]) isBoundary = true; else if (!label[nIdx]) { label[nIdx] = id; stack[sp++] = nIdx; } }
+            if (cy - 1 >= 0) { nIdx = (cy - 1) * w + cx; if (bg[nIdx] || edge[nIdx]) isBoundary = true; else if (!label[nIdx]) { label[nIdx] = id; stack[sp++] = nIdx; } }
+            if (isBoundary) boundaryPoints.push([cx, cy]);
           }
+          comps.push({ area: area, touchesBorder: touchesBorder, boundaryPoints: boundaryPoints });
         }
       }
-      if (boundaryPoints.length < 4) return null;
 
-      var hull = convexHull(boundaryPoints);
-      if (hull.length < 4) return null;
+      var frameArea = w * h;
+      var cx0 = w / 2, cy0 = h / 2;
+      var maxDist = Math.sqrt(cx0 * cx0 + cy0 * cy0);
+      var best = null, bestScore = 0;
+      for (var ci = 0; ci < comps.length; ci++) {
+        var comp = comps[ci];
+        if (comp.touchesBorder) continue; // likely desk/background leaking to the frame edge, not a discrete document
+        if (comp.area < frameArea * 0.03 || comp.area > frameArea * 0.6) continue;
+        if (comp.boundaryPoints.length < 4) continue;
 
-      var tl = hull[0], br = hull[0], tr = hull[0], bl = hull[0];
-      var minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
-      hull.forEach(function (p) {
-        var s = p[0] + p[1], df = p[0] - p[1];
-        if (s < minSum) { minSum = s; tl = p; }
-        if (s > maxSum) { maxSum = s; br = p; }
-        if (df > maxDiff) { maxDiff = df; tr = p; }
-        if (df < minDiff) { minDiff = df; bl = p; }
-      });
+        var hull = convexHull(comp.boundaryPoints);
+        if (hull.length < 4) continue;
+        var hullArea = Math.abs(shoelaceArea(hull));
+        if (hullArea < 1) continue;
+        var solidity = comp.area / hullArea;
+        if (solidity < 0.72) continue; // rejects sprawling/irregular shapes, keeps rectangle-like ones
 
-      var quadArea = Math.abs(shoelaceArea([tl, tr, br, bl]));
-      if (quadArea < w * h * 0.08) return null; // degenerate/collapsed quad
+        var tl = hull[0], br = hull[0], tr = hull[0], bl = hull[0];
+        var minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
+        hull.forEach(function (p) {
+          var s = p[0] + p[1], df = p[0] - p[1];
+          if (s < minSum) { minSum = s; tl = p; }
+          if (s > maxSum) { maxSum = s; br = p; }
+          if (df > maxDiff) { maxDiff = df; tr = p; }
+          if (df < minDiff) { minDiff = df; bl = p; }
+        });
+        var quadArea = Math.abs(shoelaceArea([tl, tr, br, bl]));
+        if (quadArea < frameArea * 0.03) continue;
+        var quadFit = quadArea / hullArea; // close to 1 means the hull really is ~quadrilateral
+        if (quadFit < 0.8) continue;
+
+        var ccx = (tl[0] + tr[0] + br[0] + bl[0]) / 4;
+        var ccy = (tl[1] + tr[1] + br[1] + bl[1]) / 4;
+        var distFromCenter = Math.sqrt((ccx - cx0) * (ccx - cx0) + (ccy - cy0) * (ccy - cy0));
+        var centerWeight = 1 - 0.4 * (distFromCenter / maxDist);
+
+        var score = quadArea * solidity * quadFit * centerWeight;
+        if (score > bestScore) {
+          bestScore = score;
+          best = { tl: tl, tr: tr, br: br, bl: bl };
+        }
+      }
+
+      if (!best) return null;
 
       return {
-        tl: { x: tl[0] / w, y: tl[1] / h },
-        tr: { x: tr[0] / w, y: tr[1] / h },
-        br: { x: br[0] / w, y: br[1] / h },
-        bl: { x: bl[0] / w, y: bl[1] / h }
+        tl: { x: best.tl[0] / w, y: best.tl[1] / h },
+        tr: { x: best.tr[0] / w, y: best.tr[1] / h },
+        br: { x: best.br[0] / w, y: best.br[1] / h },
+        bl: { x: best.bl[0] / w, y: best.bl[1] / h }
       };
     } catch (err) {
       return null; // canvas read errors (e.g. tainted canvas) — fall back silently
