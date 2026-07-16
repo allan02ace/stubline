@@ -838,6 +838,33 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     color: var(--ink-faint);
     font-size: 11.5px;
     padding: 6px 20px 2px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .editor-hint #autoDetectBtn {
+    background: none;
+    border: 1px solid rgba(247,243,232,0.3);
+    color: #EDE6D2;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 20px;
+    cursor: pointer;
+  }
+  .editor-hint #autoDetectBtn:active { background: rgba(247,243,232,0.12); }
+  .editor-toggles {
+    padding: 4px 20px 0;
+  }
+  .editor-toggles .toggle-row {
+    border-top: 1px solid rgba(247,243,232,0.14);
+    color: #EDE6D2;
+    font-size: 12.5px;
+  }
+  .editor-toggles .toggle-row:first-child {
+    border-top: none;
   }
   .editor-bottom {
     padding: 14px 18px calc(var(--safe-bottom) + 16px);
@@ -1005,7 +1032,20 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   <div class="editor-canvas-wrap" id="editorCanvasWrap">
     <canvas id="cropCanvas"></canvas>
   </div>
-  <div class="editor-hint">Drag the corners to trace the receipt's edges</div>
+  <div class="editor-hint">
+    Edges traced automatically — drag a corner to fine-tune
+    <button id="autoDetectBtn" type="button">↺ Re-detect</button>
+  </div>
+  <div class="editor-toggles">
+    <div class="toggle-row">
+      <span>Black &amp; white scan mode</span>
+      <div class="switch on" id="bwSwitch"></div>
+    </div>
+    <div class="toggle-row">
+      <span>Sharpen contrast</span>
+      <div class="switch on" id="contrastSwitch"></div>
+    </div>
+  </div>
   <div class="editor-bottom">
     <button class="btn btn-secondary" id="useFullBtn" type="button">Use full frame</button>
     <button class="btn btn-primary" id="applyCropBtn" type="button">Crop &amp; keep</button>
@@ -1020,14 +1060,6 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   <div class="field">
     <label for="pdfName">File name</label>
     <input type="text" id="pdfName" value="receipts">
-  </div>
-  <div class="toggle-row">
-    <span>Black &amp; white scan mode</span>
-    <div class="switch on" id="bwSwitch"></div>
-  </div>
-  <div class="toggle-row">
-    <span>Sharpen contrast</span>
-    <div class="switch on" id="contrastSwitch"></div>
   </div>
   <div class="action-bar" style="border:none; margin:14px 0 0; padding:0;">
     <button class="btn btn-ghost" id="cancelExportBtn" type="button">Cancel</button>
@@ -1167,13 +1199,13 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     var img = new Image();
     img.onload = function () {
       cropImg = img;
-      layoutEditor();
       editor.classList.add("show");
+      layoutEditor();
     };
     img.src = dataUrl;
   }
 
-  function layoutEditor() {
+  function layoutEditor(useDetection) {
     var maxW = editorCanvasWrap.clientWidth - 20;
     var maxH = editorCanvasWrap.clientHeight - 20;
     var scale = Math.min(maxW / cropImg.naturalWidth, maxH / cropImg.naturalHeight, 1);
@@ -1184,15 +1216,295 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     cropCanvas.style.width = cw + "px";
     cropCanvas.style.height = ch + "px";
 
-    var inset = 0.06;
-    corners = [
-      { x: cw * inset, y: ch * inset },             // TL
-      { x: cw * (1 - inset), y: ch * inset },        // TR
-      { x: cw * (1 - inset), y: ch * (1 - inset) },  // BR
-      { x: cw * inset, y: ch * (1 - inset) }         // BL
-    ];
+    var quad = (useDetection !== false) ? detectQuad(cropImg) : null;
+    var box = (!quad && useDetection !== false) ? detectEdgeBox(cropImg) : null;
+    if (quad) {
+      corners = [
+        { x: quad.tl.x * cw, y: quad.tl.y * ch },
+        { x: quad.tr.x * cw, y: quad.tr.y * ch },
+        { x: quad.br.x * cw, y: quad.br.y * ch },
+        { x: quad.bl.x * cw, y: quad.bl.y * ch }
+      ];
+    } else if (box) {
+      corners = [
+        { x: box.left * cw, y: box.top * ch },
+        { x: box.right * cw, y: box.top * ch },
+        { x: box.right * cw, y: box.bottom * ch },
+        { x: box.left * cw, y: box.bottom * ch }
+      ];
+    } else {
+      var inset = 0.06;
+      corners = [
+        { x: cw * inset, y: ch * inset },             // TL
+        { x: cw * (1 - inset), y: ch * inset },        // TR
+        { x: cw * (1 - inset), y: ch * (1 - inset) },  // BR
+        { x: cw * inset, y: ch * (1 - inset) }         // BL
+      ];
+    }
     drawEditor();
     buildHandles();
+  }
+
+  // Full auto edge detection: works on a downsized grayscale copy and finds
+  // the receipt's actual four corners, including tilted/rotated shots (not
+  // just axis-aligned edges). Pipeline: blur -> Sobel gradient -> threshold
+  // to a binary edge map -> dilate to close small gaps -> flood-fill the
+  // background in from the image borders (blocked by edges) -> take the
+  // boundary of whatever's left as the document silhouette -> convex hull
+  // -> pick the 4 extreme corners (min/max of x+y and x-y, the standard
+  // "order points" trick for quadrilaterals at any rotation).
+  // Falls back to detectEdgeBox() (axis-aligned) and then a default inset
+  // if the shot is too low-contrast or the geometry looks unreliable —
+  // the corners always stay draggable for fine-tuning either way.
+  function detectQuad(img) {
+    try {
+      var work = document.createElement("canvas");
+      var scale = Math.min(1, 480 / Math.max(img.naturalWidth, img.naturalHeight));
+      var w = Math.max(2, Math.round(img.naturalWidth * scale));
+      var h = Math.max(2, Math.round(img.naturalHeight * scale));
+      work.width = w; work.height = h;
+      var ctx = work.getContext("2d");
+      ctx.drawImage(img, 0, 0, w, h);
+      var d = ctx.getImageData(0, 0, w, h).data;
+
+      var gray = new Float32Array(w * h);
+      for (var i = 0; i < w * h; i++) {
+        var o = i * 4;
+        gray[i] = 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
+      }
+      var blurred = boxBlur(gray, w, h, 1);
+
+      var mag = new Float32Array(w * h);
+      var maxMag = 0, sum = 0, sumSq = 0, cnt = 0;
+      for (var y = 1; y < h - 1; y++) {
+        for (var x = 1; x < w - 1; x++) {
+          var i00 = (y - 1) * w + (x - 1), i01 = (y - 1) * w + x, i02 = (y - 1) * w + (x + 1);
+          var i10 = y * w + (x - 1), i12 = y * w + (x + 1);
+          var i20 = (y + 1) * w + (x - 1), i21 = (y + 1) * w + x, i22 = (y + 1) * w + (x + 1);
+          var gx = (blurred[i02] + 2 * blurred[i12] + blurred[i22]) - (blurred[i00] + 2 * blurred[i10] + blurred[i20]);
+          var gy = (blurred[i20] + 2 * blurred[i21] + blurred[i22]) - (blurred[i00] + 2 * blurred[i01] + blurred[i02]);
+          var m = Math.sqrt(gx * gx + gy * gy);
+          mag[y * w + x] = m;
+          if (m > maxMag) maxMag = m;
+          sum += m; sumSq += m * m; cnt++;
+        }
+      }
+      if (maxMag < 4) return null; // essentially flat image, nothing to trace
+
+      var mean = sum / cnt;
+      var variance = Math.max(0, sumSq / cnt - mean * mean);
+      var thresh = Math.max(mean + Math.sqrt(variance) * 0.8, maxMag * 0.12);
+
+      var edge = new Uint8Array(w * h);
+      for (var i = 0; i < w * h; i++) edge[i] = mag[i] > thresh ? 1 : 0;
+      edge = dilate(edge, w, h, 2);
+
+      // flood-fill background inward from every border pixel, blocked by edges
+      var bg = new Uint8Array(w * h);
+      var queue = new Int32Array(w * h);
+      var qh = 0, qt = 0;
+      function tryPush(x, y) {
+        if (x < 0 || x >= w || y < 0 || y >= h) return;
+        var idx = y * w + x;
+        if (bg[idx] || edge[idx]) return;
+        bg[idx] = 1;
+        queue[qt++] = idx;
+      }
+      for (var x = 0; x < w; x++) { tryPush(x, 0); tryPush(x, h - 1); }
+      for (var y = 0; y < h; y++) { tryPush(0, y); tryPush(w - 1, y); }
+      while (qh < qt) {
+        var idx = queue[qh++];
+        var px = idx % w, py = (idx / w) | 0;
+        tryPush(px + 1, py); tryPush(px - 1, py); tryPush(px, py + 1); tryPush(px, py - 1);
+      }
+
+      var fgCount = 0;
+      for (var i = 0; i < w * h; i++) if (!bg[i]) fgCount++;
+      if (fgCount < w * h * 0.05 || fgCount > w * h * 0.95) return null; // unreliable blob size
+
+      // boundary points of the unreached (document) region, for the hull
+      var boundaryPoints = [];
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          var idx2 = y * w + x;
+          if (bg[idx2]) continue;
+          if (x === 0 || x === w - 1 || y === 0 || y === h - 1 ||
+              (x > 0 && bg[idx2 - 1]) || (x < w - 1 && bg[idx2 + 1]) ||
+              (y > 0 && bg[idx2 - w]) || (y < h - 1 && bg[idx2 + w])) {
+            boundaryPoints.push([x, y]);
+          }
+        }
+      }
+      if (boundaryPoints.length < 4) return null;
+
+      var hull = convexHull(boundaryPoints);
+      if (hull.length < 4) return null;
+
+      var tl = hull[0], br = hull[0], tr = hull[0], bl = hull[0];
+      var minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
+      hull.forEach(function (p) {
+        var s = p[0] + p[1], df = p[0] - p[1];
+        if (s < minSum) { minSum = s; tl = p; }
+        if (s > maxSum) { maxSum = s; br = p; }
+        if (df > maxDiff) { maxDiff = df; tr = p; }
+        if (df < minDiff) { minDiff = df; bl = p; }
+      });
+
+      var quadArea = Math.abs(shoelaceArea([tl, tr, br, bl]));
+      if (quadArea < w * h * 0.08) return null; // degenerate/collapsed quad
+
+      return {
+        tl: { x: tl[0] / w, y: tl[1] / h },
+        tr: { x: tr[0] / w, y: tr[1] / h },
+        br: { x: br[0] / w, y: br[1] / h },
+        bl: { x: bl[0] / w, y: bl[1] / h }
+      };
+    } catch (err) {
+      return null; // canvas read errors (e.g. tainted canvas) — fall back silently
+    }
+  }
+
+  function boxBlur(src, w, h, radius) {
+    var tmp = new Float32Array(w * h);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var s = 0, c = 0;
+        for (var dx = -radius; dx <= radius; dx++) {
+          var xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          s += src[y * w + xx]; c++;
+        }
+        tmp[y * w + x] = s / c;
+      }
+    }
+    var out = new Float32Array(w * h);
+    for (var x = 0; x < w; x++) {
+      for (var y = 0; y < h; y++) {
+        var s = 0, c = 0;
+        for (var dy = -radius; dy <= radius; dy++) {
+          var yy = y + dy;
+          if (yy < 0 || yy >= h) continue;
+          s += tmp[yy * w + x]; c++;
+        }
+        out[y * w + x] = s / c;
+      }
+    }
+    return out;
+  }
+
+  function dilate(mask, w, h, iterations) {
+    var cur = mask;
+    for (var it = 0; it < iterations; it++) {
+      var next = new Uint8Array(w * h);
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          var idx = y * w + x;
+          if (cur[idx]) { next[idx] = 1; continue; }
+          var on = false;
+          for (var dy = -1; dy <= 1 && !on; dy++) {
+            for (var dx = -1; dx <= 1 && !on; dx++) {
+              var xx = x + dx, yy = y + dy;
+              if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+              if (cur[yy * w + xx]) on = true;
+            }
+          }
+          next[idx] = on ? 1 : 0;
+        }
+      }
+      cur = next;
+    }
+    return cur;
+  }
+
+  function convexHull(points) {
+    var pts = points.slice().sort(function (a, b) { return a[0] - b[0] || a[1] - b[1]; });
+    var n = pts.length;
+    if (n < 3) return pts;
+    function cross(o, a, b) { return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]); }
+    var lower = [];
+    for (var i = 0; i < n; i++) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], pts[i]) <= 0) lower.pop();
+      lower.push(pts[i]);
+    }
+    var upper = [];
+    for (var i = n - 1; i >= 0; i--) {
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], pts[i]) <= 0) upper.pop();
+      upper.push(pts[i]);
+    }
+    upper.pop(); lower.pop();
+    return lower.concat(upper);
+  }
+
+  function shoelaceArea(pts) {
+    var s = 0;
+    for (var i = 0; i < pts.length; i++) {
+      var p1 = pts[i], p2 = pts[(i + 1) % pts.length];
+      s += p1[0] * p2[1] - p2[0] * p1[1];
+    }
+    return s / 2;
+  }
+
+  // Lightweight fallback: finds the strongest vertical/horizontal gradient
+  // "line" within a band near each side of the frame. Used only when the
+  // full quadrilateral trace above can't find a reliable document silhouette
+  // (e.g. very low-contrast background) — axis-aligned, but better than
+  // nothing for a roughly front-on shot.
+  function detectEdgeBox(img) {
+    try {
+      var work = document.createElement("canvas");
+      var scale = Math.min(1, 480 / Math.max(img.naturalWidth, img.naturalHeight));
+      var w = Math.max(2, Math.round(img.naturalWidth * scale));
+      var h = Math.max(2, Math.round(img.naturalHeight * scale));
+      work.width = w; work.height = h;
+      var ctx = work.getContext("2d");
+      ctx.drawImage(img, 0, 0, w, h);
+      var d = ctx.getImageData(0, 0, w, h).data;
+
+      var gray = new Float32Array(w * h);
+      for (var i = 0; i < w * h; i++) {
+        var o = i * 4;
+        gray[i] = 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
+      }
+
+      var colGrad = new Float32Array(w);
+      var rowGrad = new Float32Array(h);
+      for (var y = 1; y < h; y++) {
+        for (var x = 1; x < w; x++) {
+          var idx = y * w + x;
+          var gx = Math.abs(gray[idx] - gray[idx - 1]);
+          var gy = Math.abs(gray[idx] - gray[idx - w]);
+          colGrad[x] += gx;
+          rowGrad[y] += gy;
+        }
+      }
+
+      var left = bestIndexInBand(colGrad, 0.04, 0.42);
+      var right = bestIndexInBand(colGrad, 0.58, 0.96);
+      var top = bestIndexInBand(rowGrad, 0.04, 0.42);
+      var bottom = bestIndexInBand(rowGrad, 0.58, 0.96);
+
+      if (left === null || right === null || top === null || bottom === null) return null;
+      if (right - left < w * 0.25 || bottom - top < h * 0.25) return null;
+
+      return {
+        left: left / w,
+        right: right / w,
+        top: top / h,
+        bottom: bottom / h
+      };
+    } catch (err) {
+      return null; // canvas read errors (e.g. tainted canvas) — fall back silently
+    }
+  }
+
+  function bestIndexInBand(arr, fromPct, toPct) {
+    var from = Math.floor(arr.length * fromPct);
+    var to = Math.ceil(arr.length * toPct);
+    var bestI = null, bestV = -1;
+    for (var i = from; i < to; i++) {
+      if (arr[i] > bestV) { bestV = arr[i]; bestI = i; }
+    }
+    return bestI;
   }
 
   function drawEditor() {
@@ -1274,6 +1586,11 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     pendingCaptureDataUrl = null;
   });
 
+  document.getElementById("autoDetectBtn").addEventListener("click", function () {
+    layoutEditor(true);
+    toast("Re-traced the edges");
+  });
+
   document.getElementById("rotateInEditorBtn").addEventListener("click", function () {
     var c = document.createElement("canvas");
     c.width = cropImg.naturalHeight;
@@ -1288,7 +1605,13 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   });
 
   document.getElementById("useFullBtn").addEventListener("click", function () {
-    commitPage(cropImg.src);
+    var c = document.createElement("canvas");
+    c.width = cropImg.naturalWidth;
+    c.height = cropImg.naturalHeight;
+    var ctx = c.getContext("2d");
+    ctx.drawImage(cropImg, 0, 0);
+    applyEnhanceIfEnabled(ctx, c.width, c.height);
+    commitPage(c.toDataURL("image/jpeg", 0.92));
   });
 
   document.getElementById("applyCropBtn").addEventListener("click", function () {
@@ -1317,8 +1640,15 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     warpTriangle(octx, cropImg, [src[0], src[1], src[3]], [dst[0], dst[1], dst[3]]);
     warpTriangle(octx, cropImg, [src[1], src[2], src[3]], [dst[1], dst[2], dst[3]]);
 
+    applyEnhanceIfEnabled(octx, outW, outH);
     commitPage(out.toDataURL("image/jpeg", 0.92));
   });
+
+  function applyEnhanceIfEnabled(ctx, w, h) {
+    var bw = bwSwitch.classList.contains("on");
+    var contrastOn = contrastSwitch.classList.contains("on");
+    if (bw || contrastOn) enhanceCanvas(ctx, w, h, bw, contrastOn);
+  }
 
   function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
 
@@ -1458,8 +1788,6 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
   document.getElementById("confirmExportBtn").addEventListener("click", function () {
     if (!pages.length) return;
     var name = (document.getElementById("pdfName").value || "receipts").trim();
-    var bw = bwSwitch.classList.contains("on");
-    var contrastOn = contrastSwitch.classList.contains("on");
 
     var jsPDFCtor = window.jspdf && window.jspdf.jsPDF;
     if (!jsPDFCtor) { toast("PDF library failed to load — check your connection"); return; }
@@ -1475,12 +1803,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var r,n,i,a,
     pages.forEach(function (p, idx) {
       var img = new Image();
       img.onload = function () {
-        var c = document.createElement("canvas");
-        c.width = img.naturalWidth; c.height = img.naturalHeight;
-        var ctx = c.getContext("2d");
-        ctx.drawImage(img, 0, 0);
-        if (bw || contrastOn) enhanceCanvas(ctx, c.width, c.height, bw, contrastOn);
-        processed[idx] = { dataUrl: c.toDataURL("image/jpeg", 0.9), w: c.width, h: c.height };
+        processed[idx] = { dataUrl: p.dataUrl, w: img.naturalWidth, h: img.naturalHeight };
         loaded++;
         if (loaded === pages.length) buildPdf();
       };
